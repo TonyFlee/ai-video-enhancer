@@ -1,0 +1,35 @@
+# FastAPI backend
+fastapi==0.143.3
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+numpy==2.5.4
+psutil==7.2.2
+pydantic==2.14.1
+
+# AI frame interpolation (ONNX Runtime)
+# CUDA execution provider requires ONNX Runtime 1.22.x, which in turn needs the
+# CUDA 12 + cuDNN 9 runtime. The nvidia-*-cu12 wheels below supply those DLLs on
+# Windows without a full CUDA toolkit install; app/config.py registers their
+# site-packages "bin" folders with os.add_dll_directory at import time.
+# On a machine without an NVIDIA GPU you can drop onnxruntime-gpu and the nvidia-*
+# wheels and install plain `onnxruntime==1.22.0` instead (CPU only).
+onnxruntime-gpu==1.22.0
+nvidia-cudnn-cu12==9.27.0.42
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cuda-nvrtc-cu12==12.9.86
+nvidia-cufft-cu12==11.4.1.4
+nvidia-cusparse-cu12==12.5.10.65
+nvidia-cusolver-cu12==11.7.5.82
+nvidia-nvjitlink-cu12==12.9.86
+
+# Optional: convert the RIFE model to FP16 (scripts/fp16_variants.py) and inspect graphs
+# (scripts/inspect_model.py, scripts/probe_model_inputs.py).
+onnx==1.23.2
+onnxconverter-common==1.16.0
+
+# Required by the verification harness only:
+#   scripts/api_test.py       -> requests
+#   tests/, scripts/*.py      -> pytest
+requests==2.34.2
+pytest==9.1.1

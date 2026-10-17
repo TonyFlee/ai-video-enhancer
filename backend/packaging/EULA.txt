@@ -1,0 +1,65 @@
+AI VIDEO ENHANCER - TERMS OF USE
+================================
+
+Please read these terms. Clicking "I accept" below means you agree to them.
+
+
+1. WHAT THE APP DOES
+--------------------
+AI Video Enhancer increases the frame rate of a video file (for example 24, 25
+or 30 fps up to 60 or 120 fps) by generating brand-new intermediate frames with
+a neural network (RIFE). It runs entirely on your own computer.
+
+
+2. YOUR VIDEOS STAY ON YOUR MACHINE
+-----------------------------------
+Nothing is uploaded anywhere. There is no account, no telemetry and no
+analytics. The app binds to 127.0.0.1 (localhost) only, so no other computer on
+your network can reach it. Files are written to a local temp folder that is
+cleared automatically.
+
+
+3. YOUR ORIGINAL FILE IS SAFE
+-----------------------------
+The app never edits, overwrites or deletes the video you select. Results are
+written to a new file. Keep your own copy of the source video anyway - you are
+responsible for your own footage and for anything you publish from it.
+
+
+4. NO WARRANTY
+--------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. Frame interpolation is an estimate: generated frames can contain
+artefacts, and results depend on your GPU, driver and source footage. Check
+your output before publishing. In no event shall the author be liable for any
+claim, damages or other liability arising from the use of this software.
+
+
+5. FREE TO USE
+--------------
+You may install and use AI Video Enhancer for personal, internal or commercial
+projects, and share the unmodified installer with others. Selling or
+redistributing the installer as your own product is not allowed.
+
+
+6. BUNDLED THIRD-PARTY SOFTWARE
+-------------------------------
+This installer contains third-party components, each under its own licence:
+
+  - FFmpeg and FFprobe          https://ffmpeg.org/            (GPL build)
+  - Python                      https://python.org/            (PSF)
+  - ONNX Runtime                https://onnxruntime.ai/        (MIT)
+  - NVIDIA CUDA runtime, cuDNN  https://developer.nvidia.com/  (NVIDIA terms)
+  - pywebview                   https://pywebview.flowrl.com/  (MIT)
+
+These components are included unchanged and remain the property of their
+respective authors. The full licence texts ship with the installed application.
+
+
+7. NVIDIA HARDWARE
+------------------
+GPU acceleration requires an NVIDIA GPU and a current driver. Without one the
+app falls back to CPU interpolation, which is considerably slower.
+
+-----------------------------------------------------------------------
+Copyright (c) 2026. All rights reserved.

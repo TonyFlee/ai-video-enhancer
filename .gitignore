@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+backend/.venv/
+backend/storage/
+backend/models/*.onnx
+backend/models/*.part
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+
+# Build output
+backend/build/
+backend/dist/
+backend/installer_output/
+# FFmpeg binaries the build script copies in at build time (217 MB each - GitHub refuses >100 MB)
+backend/packaging/bin/
+
+# Env / editors
+.env
+.env.local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
