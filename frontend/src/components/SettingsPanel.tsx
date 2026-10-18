@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { Card, FieldLabel, OptionButton, Select, Toggle } from "@/components/ui";
 import type { CodecName, FitMode, JobSettings, PresetName, QualityName, SystemInfo, VideoMetadata } from "@/lib/types";
@@ -77,9 +77,12 @@ function SizeInput({
   onCommit: (value: number) => void;
 }) {
   const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
 
-  const commit = () => onCommit(clampSize(draft, value));
+  const commit = () => {
+    const nextValue = clampSize(draft, value);
+    setDraft(String(nextValue));
+    onCommit(nextValue);
+  };
 
   return (
     <input
@@ -223,6 +226,7 @@ export default function SettingsPanel({ settings, onChange, metadata, system, di
             <FieldLabel hint="64–4096 px · odd values snap to even">Output size</FieldLabel>
             <div className="flex items-center gap-2">
               <SizeInput
+                key={customWidth}
                 label="Output width"
                 value={customWidth}
                 disabled={disabled}
@@ -230,6 +234,7 @@ export default function SettingsPanel({ settings, onChange, metadata, system, di
               />
               <span className="text-sm text-zinc-500">×</span>
               <SizeInput
+                key={customHeight}
                 label="Output height"
                 value={customHeight}
                 disabled={disabled}
