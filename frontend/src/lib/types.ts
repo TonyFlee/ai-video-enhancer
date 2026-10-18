@@ -109,6 +109,30 @@ export interface SystemInfo {
   };
 }
 
+/** Reply of GET /api/update/check. `latest: null` = offline or already current. */
+export interface UpdateCheck {
+  current: string;
+  latest: string | null;
+  tag?: string;
+  url?: string;
+  sizeBytes?: number;
+  notes?: string;
+  publishedAt?: string;
+  sha256?: string | null;
+}
+
+/** Progress of the background installer download (GET /api/update/status). */
+export interface UpdateDownloadState {
+  state: "idle" | "downloading" | "ready" | "error";
+  tag: string | null;
+  received: number;
+  total: number;
+  path: string | null;
+  sha256_ok: boolean | null;
+  error: string | null;
+  percent: number | null;
+}
+
 export const DEFAULT_SETTINGS: JobSettings = {
   targetFps: 60,
   slowMotion: false,

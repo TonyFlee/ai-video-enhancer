@@ -205,6 +205,10 @@ npm run dev
 | GET | `/api/jobs/{id}/original` | Range-stream the uploaded video |
 | GET | `/api/jobs/{id}/preview` | Range-stream the enhanced video |
 | GET | `/api/jobs/{id}/download` | Download the enhanced MP4 |
+| GET | `/api/update/check` | Latest GitHub release vs. this build (`latest: null` when offline/current) |
+| POST | `/api/update/download` | Start the verified background download of the new setup |
+| GET | `/api/update/status` | Download progress / `ready` / `error` |
+| POST | `/api/update/install` | Launch the downloaded setup (visible wizard) |
 
 Interactive docs: <http://127.0.0.1:8000/docs>
 
@@ -358,8 +362,9 @@ It needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) — free, and one com
 winget install --id JRSoftware.InnoSetup -e --scope user
 ```
 
-The build is a single LZMA pass over the whole bundle, so expect a few minutes and roughly a 2.5 GB
-setup file (the sources are ~4.1 GB). What a first-time user then gets is the ordinary Windows flow —
+The build is one **solid LZMA2/max** pass over the whole bundle, so expect around 8–10 minutes and a
+setup file of roughly **1.4 GB** (the sources are ~3.2 GB — the CUDA trim in §6 keeps this under
+GitHub's 2 GB per-file cap). What a first-time user then gets is the ordinary Windows flow —
 no zip to unpack, no admin prompt:
 
 | Screen | What happens |
@@ -409,6 +414,41 @@ LZMA2-packed setup stays under that line).
 > bytes — the project page publishes the setup's SHA-256 so a visitor can check the download
 > themselves.
 
+### Updating an installed app (built-in updater)
+
+The app asks GitHub for the latest release once on open — one request, cached for six hours, and
+silent on every failure, so an offline machine simply shows no banner. When a newer release exists:
+
+```
+UPDATE   Version 1.1.0 is available   1.4 GB · you have 1.0.0        [ Update now ] [ Later ]
+```
+
+- **Update now** downloads the setup in the background (live progress in the banner), checks its
+  SHA-256 against the hash published in the release notes, then opens the ordinary setup wizard.
+  The installer closes the running app itself and its *Finish* page reopens the updated version.
+- **Later** hides the banner for that release only — the next release will offer itself again.
+
+For the hash check to happen, the release notes need one line like:
+
+```
+SHA-256: 4c633b7907fbee77cc976101e93cd3218a8bbd7ed43e97e144ce94c1f563e7ea
+```
+
+Without that line the update still installs (the download is already authenticated by HTTPS), but
+`app.log` records that there was nothing to verify against. A mismatch is a hard stop — the file is
+deleted, never launched.
+
+Cutting a release touches three version-stamped places:
+
+| Where | Change |
+| --- | --- |
+| `backend/app/config.py` | `AVE_VERSION` default (`1.0.0` → `1.1.0`) — what the app compares against |
+| `scripts/build_installer.ps1` | `-Version 1.1.0` — stamps the setup and *Settings > Apps* |
+| portfolio `.env` / Vercel | `AVE_RELEASE_URL` + `NEXT_PUBLIC_AVE_DOWNLOAD_URL` → the new asset name |
+
+The whole flow is testable without publishing: `AVE_UPDATE_API` can point at a local mock of the
+GitHub API (see `AVE_UPDATE_API` / `AVE_UPDATE_REPO` / `AVE_VERSION` in §7).
+
 ---
 
 ## 7. Configuration
@@ -432,6 +472,9 @@ Environment variables (all optional):
 | `AVE_SERVE_UI` | off in a source checkout, on when frozen | Serve the statically exported UI from FastAPI (the desktop app does this) |
 | `AVE_UI_DIR` | `<bundle>/ui` | Static UI directory when `AVE_SERVE_UI` is on; point it at `frontend/out` to preview the real desktop build in dev |
 | `AVE_LOCAL_DIR` | `%LOCALAPPDATA%\AI Video Enhancer` | Where the packaged app keeps storage and `app.log` |
+| `AVE_VERSION` | `1.0.0` | Version this build reports; the updater compares GitHub releases against it. Bump together with the installer version |
+| `AVE_UPDATE_REPO` | `TonyFlee/ai-video-enhancer` | GitHub repo whose latest release is offered as an update |
+| `AVE_UPDATE_API` | `https://api.github.com/repos/{repo}/releases/latest` | Override the release-check URL (development/testing; a literal URL without `{repo}` is fine) |
 | `AVE_CPU_ONLY` | off | Build-time only: `build_windows_app.ps1 -CpuOnly` sets it to drop the CUDA DLLs |
 
 > `AVE_PROXY_MAX_BODY` trades memory for upload size: Next.js buffers each proxied request body in RAM,
@@ -559,6 +602,7 @@ AI Video Enhancer/
 │  │  ├─ rife.py        # ONNX session, provider selection, tiling, fallback
 │  │  ├─ pipeline.py    # decode → interpolate → encode streaming pipeline
 │  │  ├─ jobs.py        # background jobs, progress, cancel, cleanup
+│  │  ├─ update.py      # GitHub release check + verified background download of the new setup
 │  │  ├─ schemas.py     # request/response models + presets
 │  │  ├─ main.py        # FastAPI app and routes (incl. range streaming + static UI)
 │  │  └─ subproc.py     # CREATE_NO_WINDOW wrappers - every ffmpeg/ffprobe/nvidia-smi spawn goes through here
@@ -570,7 +614,7 @@ AI Video Enhancer/
 │  └─ requirements.txt
 ├─ frontend/
 │  ├─ src/app/          # layout, dashboard page, global styles
-│  ├─ src/components/   # Dropzone, SettingsPanel, ProgressPanel, ComparePlayer, …
+│  ├─ src/components/   # Dropzone, SettingsPanel, ProgressPanel, ComparePlayer, UpdateBanner, …
 │  ├─ src/lib/          # api client, types, formatters
 │  ├─ out/              # static export used by the packaged app (NEXT_EXPORT=1)
 │  └─ next.config.ts    # /api proxy to FastAPI (dev) / static export (desktop)

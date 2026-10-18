@@ -18,10 +18,11 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
-from . import subproc
+from . import subproc, update
 
 from .config import (
     ALLOWED_VIDEO_EXTENSIONS,
+    AVE_VERSION,
     MAX_DURATION_SECONDS,
     MAX_UPLOAD_BYTES,
     UPLOADS_DIR,
@@ -68,7 +69,7 @@ async def lifespan(app: FastAPI):
     stop.set()
 
 
-app = FastAPI(title="AI Video Enhancer API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AI Video Enhancer API", version=AVE_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -380,6 +381,53 @@ def download(job_id: str, request: Request) -> Response:
     suffix = f"_{fps:g}fps" if fps else ""
     download_name = f"{stem}_enhanced{suffix}.mp4"
     return _range_response(job.output_path, request, as_attachment=True, download_name=download_name)
+
+
+# ----------------------------------------------------------------------- update
+@app.get("/api/update/check")
+def update_check(force: bool = False) -> dict:
+    """Latest release from GitHub. latest=null when offline, rate-limited or
+    already up to date - the banner just stays hidden, this never errors."""
+    info = update.check_for_update(force=force)
+    payload: dict = {"current": AVE_VERSION, "latest": None}
+    if info:
+        payload.update(
+            {
+                "latest": info.version,
+                "tag": info.tag,
+                "url": info.url,
+                "sizeBytes": info.size_bytes,
+                "notes": info.notes,
+                "publishedAt": info.published_at,
+                "sha256": info.sha256,
+            }
+        )
+    return payload
+
+
+@app.get("/api/update/status")
+def update_download_status() -> dict:
+    return update.download_state()
+
+
+@app.post("/api/update/download")
+def update_download() -> dict:
+    info = update.check_for_update()
+    if info is None:
+        raise HTTPException(status_code=409, detail="No update available (or the check failed offline).")
+    return update.start_download(info)
+
+
+@app.post("/api/update/install")
+def update_install() -> dict:
+    installer = update.ready_installer()
+    if installer is None:
+        raise HTTPException(status_code=409, detail="The update has not finished downloading yet.")
+    try:
+        update.launch_installer(installer)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not start the installer: {exc}") from exc
+    return {"launched": True}
 
 
 @app.exception_handler(RifeError)

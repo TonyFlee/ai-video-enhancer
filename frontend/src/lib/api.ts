@@ -1,4 +1,4 @@
-import type { JobSettings, JobState, SystemInfo, VideoMetadata } from "./types";
+import type { JobSettings, JobState, SystemInfo, UpdateCheck, UpdateDownloadState, VideoMetadata } from "./types";
 
 async function parseError(response: Response): Promise<string> {
   try {
@@ -108,3 +108,28 @@ export async function deleteJob(jobId: string): Promise<void> {
 export const originalUrl = (jobId: string) => `/api/jobs/${jobId}/original`;
 export const previewUrl = (jobId: string) => `/api/jobs/${jobId}/preview`;
 export const downloadUrl = (jobId: string) => `/api/jobs/${jobId}/download`;
+
+// ------------------------------------------------------------------ updates
+export async function checkUpdate(): Promise<UpdateCheck> {
+  const response = await fetch("/api/update/check", { cache: "no-store" });
+  if (!response.ok) throw await asApiError(response);
+  return response.json();
+}
+
+export async function startUpdateDownload(): Promise<UpdateDownloadState> {
+  const response = await fetch("/api/update/download", { method: "POST" });
+  if (!response.ok) throw await asApiError(response);
+  return response.json();
+}
+
+export async function getUpdateStatus(): Promise<UpdateDownloadState> {
+  const response = await fetch("/api/update/status", { cache: "no-store" });
+  if (!response.ok) throw await asApiError(response);
+  return response.json();
+}
+
+export async function installUpdate(): Promise<{ launched: boolean }> {
+  const response = await fetch("/api/update/install", { method: "POST" });
+  if (!response.ok) throw await asApiError(response);
+  return response.json();
+}

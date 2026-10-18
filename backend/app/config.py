@@ -13,6 +13,15 @@ from . import subproc
 # Backend root directory (backend/)
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# The app version. Single source of truth for the API, the update check and the
+# banner in the UI. The installer gets its version separately - bump both when
+# cutting a release (backend/scripts/build_installer.ps1 -Version x.y.z).
+AVE_VERSION = os.environ.get("AVE_VERSION", "1.0.0")
+
+# Where updates are fetched from (GitHub Releases of the public app repo).
+# Overridable so tests never touch the real API.
+UPDATE_REPO = os.environ.get("AVE_UPDATE_REPO", "TonyFlee/ai-video-enhancer")
+
 # ------------------------------------------------------------------ packaging
 # The desktop app is a PyInstaller bundle: `sys.frozen` is set and the read-only
 # payload (models, UI, FFmpeg) lives under sys._MEIPASS, while everything that

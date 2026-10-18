@@ -6,6 +6,7 @@ Run with:
 """
 from __future__ import annotations
 
+import io
 import math
 import re
 import subprocess
@@ -693,4 +694,169 @@ def test_ave_no_window_runs_headless(monkeypatch):
     assert desktop.main() == 0
     assert opened == [], "headless mode must not open a desktop window"
     assert waited == [True], "headless mode must keep the engine alive"
+
+
+# ------------------------------------------------------------------ updates
+class _FakeResponse:
+    """Stand-in for urllib's response object: streamed reads + context manager."""
+
+    def __init__(self, payload: bytes, headers: dict | None = None):
+        self._buf = io.BytesIO(payload)
+        self.headers = headers or {}
+
+    def read(self, size: int = -1) -> bytes:
+        return self._buf.read(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_release(tag: str = "v9.9.9", body: str = "New stuff.\nSHA-256: {sha}\n") -> bytes:
+    import hashlib
+    import json
+
+    payload = hashlib.sha256(b"installer-bytes").hexdigest()
+    return json.dumps(
+        {
+            "tag_name": tag,
+            "body": body.format(sha=payload),
+            "published_at": "2026-10-19T00:00:00Z",
+            "assets": [
+                {
+                    "name": f"AI-Video-Enhancer-Setup-{tag.lstrip('v')}.exe",
+                    "browser_download_url": f"https://github.com/x/y/releases/download/{tag}/setup.exe",
+                    "size": 16,
+                }
+            ],
+        }
+    ).encode()
+
+
+def test_semver_compare():
+    from app.update import is_newer, parse_version
+
+    assert parse_version("v1.2.3") == (1, 2, 3)
+    assert parse_version("1.10") == (1, 10, 0)
+    assert parse_version("") == (0, 0, 0)
+    assert is_newer("v1.0.1", "1.0.0") is True
+    assert is_newer("v1.0.0", "1.0.0") is False
+    assert is_newer("v0.9.9", "1.0.0") is False
+    assert is_newer("v2.0", "1.9.9") is True
+
+
+def test_update_check_parses_release_and_hides_failures(monkeypatch):
+    from app import update
+
+    monkeypatch.setattr(update, "_CHECK_CACHE", None)
+    monkeypatch.setattr(update, "UPDATE_REPO", "example/app")
+
+    # 1. A real newer release -> parsed, SHA line extracted and stripped from notes.
+    monkeypatch.setattr(update.urlrequest, "urlopen", lambda req, timeout: _FakeResponse(_fake_release()))
+    info = update.check_for_update(force=True)
+    assert info is not None
+    assert info.tag == "v9.9.9"
+    assert info.version == "9.9.9"
+    assert info.size_bytes == 16
+    assert info.notes == "New stuff."
+    assert info.sha256 and len(info.sha256) == 64
+
+    # 2. Cached - the second call must not hit the network again.
+    def _boom(req, timeout):
+        raise AssertionError("cache miss: network was hit again")
+
+    monkeypatch.setattr(update.urlrequest, "urlopen", _boom)
+    assert update.check_for_update(force=False) is not None
+
+    # 3. Same version as installed -> no update.
+    monkeypatch.setattr(update, "_CHECK_CACHE", None)
+    monkeypatch.setattr(
+        update.urlrequest, "urlopen", lambda req, timeout: _FakeResponse(_fake_release(tag="v1.0.0"))
+    )
+    assert update.check_for_update(force=True) is None
+
+    # 4. Offline / API down -> None, never an exception.
+    def _offline(req, timeout):
+        raise OSError("no network")
+
+    monkeypatch.setattr(update.urlrequest, "urlopen", _offline)
+    assert update.check_for_update(force=True) is None
+
+    # 5. Release without an installer asset -> ignored.
+    monkeypatch.setattr(update, "_CHECK_CACHE", None)
+    import json
+
+    payload = json.loads(_fake_release())
+    payload["assets"] = []
+    monkeypatch.setattr(
+        update.urlrequest, "urlopen", lambda req, timeout: _FakeResponse(json.dumps(payload).encode())
+    )
+    assert update.check_for_update(force=True) is None
+
+
+def test_update_download_verifies_sha256(monkeypatch, tmp_path):
+    import hashlib
+
+    from app import update
+
+    content = b"installer-bytes"
+    good_sha = hashlib.sha256(content).hexdigest()
+
+    class _FakeUrlLib:
+        """Duck-typed urllib.request: passthrough Request + canned response."""
+
+        @staticmethod
+        def Request(url, headers=None):  # noqa: N803 - mirrors urllib's signature
+            return url
+
+        @staticmethod
+        def urlopen(req, timeout):
+            return _FakeResponse(content, {"Content-Length": str(len(content))})
+
+    monkeypatch.setattr(update, "STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(update, "urlrequest", _FakeUrlLib)
+
+    info = update.UpdateInfo(
+        tag="v9.9.9",
+        version="9.9.9",
+        url="https://github.com/x/y/releases/download/v9.9.9/setup.exe",
+        size_bytes=len(content),
+        notes="",
+        published_at="",
+        sha256=good_sha,
+    )
+    update._DOWNLOAD.__init__()  # reset module state between tests
+    update.start_download(info)
+    for _ in range(500):
+        if update._DOWNLOAD.state != "downloading":
+            break
+        time.sleep(0.01)
+    assert update._DOWNLOAD.state == "ready", update._DOWNLOAD.error
+    assert update._DOWNLOAD.received == len(content)
+    assert update._DOWNLOAD.sha256_ok is True
+    installer = update.ready_installer()
+    assert installer is not None and installer.read_bytes() == content
+
+    # Wrong published hash -> the file is deleted and the state is an error.
+    monkeypatch.setattr(update, "STORAGE_DIR", tmp_path / "bad")
+    bad = update.UpdateInfo(**{**info.__dict__, "sha256": "0" * 64})
+    update._DOWNLOAD.__init__()
+    update.start_download(bad)
+    for _ in range(500):
+        if update._DOWNLOAD.state != "downloading":
+            break
+        time.sleep(0.01)
+    assert update._DOWNLOAD.state == "error"
+    assert update._DOWNLOAD.sha256_ok is False
+    assert update.ready_installer() is None
+
+
+def test_update_install_requires_a_ready_installer():
+    from app import update
+
+    update._DOWNLOAD.__init__()
+    assert update.ready_installer() is None
+
 

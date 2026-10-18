@@ -8,6 +8,7 @@ import { EnhancedStats, SourceStats } from "@/components/MetaGrid";
 import ProgressPanel from "@/components/ProgressPanel";
 import SettingsPanel from "@/components/SettingsPanel";
 import SystemStatus from "@/components/SystemStatus";
+import UpdateBanner from "@/components/UpdateBanner";
 import { Card } from "@/components/ui";
 import {
   ApiError,
@@ -325,6 +326,8 @@ export default function Home() {
         </div>
         <SystemStatus system={system} />
       </header>
+
+      <UpdateBanner />
 
       {error && (
         <div className="flex items-start justify-between gap-4 rounded-xl border border-red-500/40 bg-red-500/5 px-4 py-3">
