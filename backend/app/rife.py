@@ -28,10 +28,14 @@ from .config import gpu_memory_info, register_nvidia_dll_dirs
 logger = logging.getLogger(__name__)
 
 TILE_OVERLAP = 32          # pixels of context when tiling
+MIN_TILE_HEIGHT = 96       # never shrink below this; below it the overlap dominates
 # Tile height used when memory is tight. Tuned on a 4 GB card: 384 gave the best
 # throughput without the cuDNN workspace thrashing seen at 640+. Override with
 # AVE_TILE_HEIGHT for other GPUs.
-DEFAULT_TILE_HEIGHT = int(os.environ.get("AVE_TILE_HEIGHT", "384"))
+try:
+    DEFAULT_TILE_HEIGHT = max(MIN_TILE_HEIGHT, int(os.environ.get("AVE_TILE_HEIGHT", "384")))
+except (TypeError, ValueError):
+    DEFAULT_TILE_HEIGHT = 384
 
 # Rough peak working-set per output pixel for a full-frame fp32 RIFE pass on CUDA,
 # derived from measurements (720p ~= 0.92 MP spiked past the ~950 MB that was free on
@@ -223,6 +227,20 @@ class RifeEngine:
     def tiling(self) -> bool:
         return self._use_tiles
 
+    def begin_job(self) -> None:
+        """Reset per-job tiling state.
+
+        A previous job may have switched to tiling (or shrunk the tile height) after
+        an OOM. That decision was specific to that job's frame size and free VRAM,
+        so keeping it forever made every later job slower. The next frame calls
+        ``_auto_tile_for`` again and re-enables tiling if it is still needed.
+        """
+        with self._lock:
+            self.last_error = None
+            if self.using_gpu:
+                self._use_tiles = False
+                self._tile_height = DEFAULT_TILE_HEIGHT
+
     def describe(self) -> dict:
         return {
             "loaded": True,
@@ -353,10 +371,24 @@ class RifeEngine:
                 if not self._use_tiles:
                     logger.warning("GPU memory low, enabling tiled inference: %s", exc)
                     self._use_tiles = True
+
+                # Tile inference can still run out of VRAM on a small card. Shrink
+                # the tile once (and again if needed) before giving up on the GPU;
+                # falling back to CPU is correct but roughly two orders of magnitude
+                # slower, so it is the last resort.
+                for _ in range(4):
                     try:
                         return self._infer_tiled(a, b, t)
                     except Exception as tile_exc:  # noqa: BLE001
-                        logger.warning("Tiled inference failed (%s); falling back to CPU", tile_exc)
+                        if not _is_oom(tile_exc) or self._tile_height <= MIN_TILE_HEIGHT:
+                            logger.warning("Tiled inference failed (%s); falling back to CPU", tile_exc)
+                            break
+                        self._tile_height = max(MIN_TILE_HEIGHT, self._tile_height // 2)
+                        logger.warning(
+                            "Tiled inference ran out of memory; retrying with tile height %d",
+                            self._tile_height,
+                        )
+
                 self._fallback_to_cpu()
                 return self._infer_raw(a, b, t)
 

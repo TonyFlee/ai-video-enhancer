@@ -1,4 +1,4 @@
-export type PresetName = "tiktok" | "reels" | "shorts" | "custom" | "original";
+export type PresetName = "tiktok" | "reels" | "shorts" | "vertical_1080p" | "custom" | "original";
 export type FitMode = "cover" | "contain" | "original";
 export type CodecName = "h264" | "h265";
 export type QualityName = "high" | "balanced" | "fast";
@@ -86,6 +86,7 @@ export interface SystemInfo {
   ffmpegPath: string | null;
   rifeModelAvailable: boolean;
   rifeDevice: string | null;
+  rifeError: string | null;
   rifeProviders: string[];
   rifeTiling: boolean;
   nvencAvailable: boolean;

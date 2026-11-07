@@ -1,10 +1,10 @@
 # FastAPI backend
-fastapi==0.143.3
+fastapi==0.162.1
 uvicorn[standard]==0.54.0
-python-multipart==0.0.32
+python-multipart==0.0.33
 numpy==2.5.4
 psutil==7.2.2
-pydantic==2.14.1
+pydantic==2.14.3
 
 # AI frame interpolation (ONNX Runtime)
 # CUDA execution provider requires ONNX Runtime 1.22.x, which in turn needs the
@@ -14,7 +14,7 @@ pydantic==2.14.1
 # On a machine without an NVIDIA GPU you can drop onnxruntime-gpu and the nvidia-*
 # wheels and install plain `onnxruntime==1.22.0` instead (CPU only).
 onnxruntime-gpu==1.22.0
-nvidia-cudnn-cu12==9.27.0.42
+nvidia-cudnn-cu12==9.28.1.4
 nvidia-cublas-cu12==12.9.2.10
 nvidia-cuda-runtime-cu12==12.9.79
 nvidia-cuda-nvrtc-cu12==12.9.86
@@ -30,6 +30,7 @@ onnxconverter-common==1.16.0
 
 # Required by the verification harness only:
 #   scripts/api_test.py       -> requests
-#   tests/, scripts/*.py      -> pytest
+#   tests/, scripts/*.py      -> pytest, httpx2 (FastAPI TestClient)
 requests==2.34.2
-pytest==9.1.1
+httpx2==2.16.0
+pytest==9.2.0

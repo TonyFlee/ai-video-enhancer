@@ -54,6 +54,20 @@ const PROCESSING_DETAIL: Array<{ value: number; title: string; description: stri
 const SIZE_MIN = 64;
 const SIZE_MAX = 4096;
 
+/** Friendly codec/encoder availability derived from a backend encoder name. */
+export function describeEncoder(
+  codec: CodecName,
+  name: string | null | undefined,
+): { available: boolean; label: string } {
+  const codecLabel = codec === "h264" ? "H.264" : "H.265 / HEVC";
+  if (!name) return { available: false, label: `${codecLabel} · unavailable` };
+  const hardware = name.includes("nvenc");
+  return {
+    available: true,
+    label: `${codecLabel} · ${hardware ? "NVENC GPU" : "CPU"}`,
+  };
+}
+
 /** Parse a size input, tolerating empty/invalid text and clamping to the allowed range. */
 function clampSize(raw: string, fallback: number): number {
   const value = Number(raw);
@@ -140,6 +154,10 @@ export default function SettingsPanel({ settings, onChange, metadata, system, di
 
   const warning = fpsWarning(settings.targetFps, metadata, settings.slowMotion, settings.slowMotionSpeed);
   const bitrateHint = system?.presets.bitrateHintMbps[settings.preset] ?? 12;
+  const h264 = describeEncoder("h264", system?.h264Encoder);
+  const h265 = describeEncoder("h265", system?.h265Encoder);
+  const selectedEncoder = settings.codec === "h265" ? h265 : h264;
+  const noEncoder = system != null && !h264.available && !h265.available;
 
   return (
     <div className="space-y-4">
@@ -292,14 +310,27 @@ export default function SettingsPanel({ settings, onChange, metadata, system, di
               options={[
                 {
                   value: "h264",
-                  label: `H.264 · ${system?.nvencAvailable ? "NVENC GPU" : "CPU"} (most compatible)`,
+                  label: system ? h264.label : "H.264 · most compatible",
+                  disabled: system != null && !h264.available,
                 },
                 {
                   value: "h265",
-                  label: `H.265 / HEVC · ${system?.nvencAvailable ? "NVENC GPU" : "CPU"} (smaller)`,
+                  label: system ? h265.label : "H.265 / HEVC · smaller files",
+                  disabled: system != null && !h265.available,
                 },
               ]}
             />
+            {noEncoder && (
+              <p className="mt-2 text-[11px] text-red-300">
+                No supported video encoder was detected. Check that FFmpeg is installed and on PATH.
+              </p>
+            )}
+            {!noEncoder && system != null && !selectedEncoder.available && (
+              <p className="mt-2 text-[11px] text-amber-300">
+                {settings.codec === "h265" ? "H.265" : "H.264"} is not available in this FFmpeg build —
+                choose the other codec.
+              </p>
+            )}
           </div>
           <div>
             <FieldLabel>Audio bitrate</FieldLabel>
@@ -365,9 +396,15 @@ export default function SettingsPanel({ settings, onChange, metadata, system, di
           <Toggle
             checked={settings.preferGpu}
             onChange={(value) => update("preferGpu", value)}
-            disabled={disabled}
+            disabled={disabled || (system != null && !selectedEncoder.available)}
             label="Prefer GPU encoding (NVENC) when available"
-            description="Falls back to CPU automatically"
+            description={
+              system == null
+                ? "Falls back to CPU automatically"
+                : selectedEncoder.available && selectedEncoder.label.includes("NVENC")
+                  ? "Uses the dedicated hardware encoder; falls back to CPU automatically"
+                  : "No NVENC encoder for this codec — CPU encoding will be used"
+            }
           />
         </div>
       </Card>

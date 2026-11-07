@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import os
 import shutil
 import subprocess
@@ -13,14 +14,69 @@ from . import subproc
 # Backend root directory (backend/)
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+# --------------------------------------------------------------- env parsing
+# A malformed environment variable must not stop the app from starting. These
+# helpers fall back to the documented default instead of raising at import time.
+def _env_str(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return value.strip() if value and value.strip() else default
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    return int(
+        round(
+            _env_float(
+                name,
+                float(default),
+                minimum=float(minimum),
+                maximum=float(maximum) if maximum is not None else None,
+            )
+        )
+    )
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # The app version. Single source of truth for the API, the update check and the
 # banner in the UI. The installer gets its version separately - bump both when
 # cutting a release (backend/scripts/build_installer.ps1 -Version x.y.z).
-AVE_VERSION = os.environ.get("AVE_VERSION", "1.0.0")
+AVE_VERSION = _env_str("AVE_VERSION", "1.0.0")
 
 # Where updates are fetched from (GitHub Releases of the public app repo).
 # Overridable so tests never touch the real API.
-UPDATE_REPO = os.environ.get("AVE_UPDATE_REPO", "TonyFlee/ai-video-enhancer")
+UPDATE_REPO = _env_str("AVE_UPDATE_REPO", "TonyFlee/ai-video-enhancer")
 
 # ------------------------------------------------------------------ packaging
 # The desktop app is a PyInstaller bundle: `sys.frozen` is set and the read-only
@@ -38,7 +94,7 @@ BUNDLE_UI_DIR = RESOURCE_DIR / "ui"     # static export of the Next.js frontend
 
 # Static UI: served by FastAPI itself in the desktop app. Off by default in a
 # source checkout so `next dev` stays the only UI server during development.
-SERVE_UI = os.environ.get("AVE_SERVE_UI", "1" if IS_FROZEN else "") not in ("", "0", "false")
+SERVE_UI = _env_bool("AVE_SERVE_UI", IS_FROZEN)
 UI_DIR = Path(os.environ["AVE_UI_DIR"]) if os.environ.get("AVE_UI_DIR") else BUNDLE_UI_DIR
 
 MODELS_DIR = Path(
@@ -58,8 +114,10 @@ TMP_DIR = STORAGE_DIR / "tmp"
 RIFE_MODEL_PATH = MODELS_DIR / os.environ.get("AVE_RIFE_MODEL", "RIFE_fp32_timestep.onnx")
 
 # Validation limits
-MAX_UPLOAD_BYTES = int(os.environ.get("AVE_MAX_UPLOAD_GB", "4")) * 1024**3
-MAX_DURATION_SECONDS = float(os.environ.get("AVE_MAX_DURATION_MIN", "30")) * 60.0
+MAX_UPLOAD_BYTES = int(_env_float("AVE_MAX_UPLOAD_GB", 4.0, minimum=0.1, maximum=100.0) * 1024**3)
+MAX_DURATION_SECONDS = (
+    _env_float("AVE_MAX_DURATION_MIN", 30.0, minimum=0.1, maximum=24 * 60) * 60.0
+)
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".ts", ".mts", ".m2ts"}
 ALLOWED_VIDEO_CODECS = {
     "h264", "hevc", "vp8", "vp9", "av1", "mpeg4", "mpeg2video", "wmv2", "wmv3", "prores", "dnxhd", "h263",
@@ -72,7 +130,7 @@ NVENC_PRESET = "p5"
 NVENC_TUNE = "hq"
 
 # Job retention: delete job files after this many hours
-JOB_TTL_HOURS = float(os.environ.get("AVE_JOB_TTL_HOURS", "4"))
+JOB_TTL_HOURS = _env_float("AVE_JOB_TTL_HOURS", 4.0, minimum=0.1, maximum=24 * 30)
 
 # FFmpeg binary discovery: allow override, then rely on PATH
 # FFmpeg binary discovery: explicit override, then PATH, then common Windows install

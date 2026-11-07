@@ -92,7 +92,9 @@ export default function Dropzone({
           <p className="mt-1 text-xs text-zinc-500">
             {file
               ? `${formatBytes(file.size)} · click to choose a different video`
-              : `MP4, MOV, MKV, AVI, WEBM · up to ${formatBytes(maxBytes ?? 0)}`}
+              : maxBytes
+                ? `MP4, MOV, MKV, AVI, WEBM · up to ${formatBytes(maxBytes)}`
+                : "MP4, MOV, MKV, AVI, WEBM"}
           </p>
         </div>
         <input
@@ -101,7 +103,12 @@ export default function Dropzone({
           accept={allowedExtensions?.join(",") ?? "video/*"}
           className="hidden"
           disabled={disabled}
-          onChange={(event) => handleFiles(event.target.files)}
+          onChange={(event) => {
+            handleFiles(event.target.files);
+            // Allow selecting the same file again after a probe error: without
+            // this the input's value is unchanged and no change event fires.
+            event.target.value = "";
+          }}
         />
       </div>
       {shownError && (

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 
 from .config import ALLOWED_VIDEO_CODECS, FFPROBE
 from . import subproc
@@ -56,13 +58,34 @@ class VideoInfo:
         }
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """int() that tolerates ffprobe's "N/A"/empty/malformed strings."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _positive_float(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
+
+
 def _parse_fps(rate: str | None) -> float:
     if not rate or rate in ("0/0", "N/A"):
         return 0.0
     try:
-        return float(Fraction(rate))
+        value = float(Fraction(rate))
     except (ZeroDivisionError, ValueError):
         return 0.0
+    # Guard against corrupt metadata such as "999999/1": it would create a
+    # nonsensical frame plan and overflow the job's frame counters.
+    if not math.isfinite(value) or value <= 0 or value > 1000:
+        return 0.0
+    return value
 
 
 def _parse_rotation(stream: dict) -> int:
@@ -117,12 +140,9 @@ def probe_video(path: str) -> VideoInfo:
 
     duration = 0.0
     for candidate in (video.get("duration"), fmt.get("duration")):
-        try:
-            duration = float(candidate)
-            if duration > 0:
-                break
-        except (TypeError, ValueError):
-            continue
+        duration = _positive_float(candidate)
+        if duration > 0:
+            break
 
     fps = _parse_fps(video.get("avg_frame_rate"))
     if fps <= 0:
@@ -130,31 +150,41 @@ def probe_video(path: str) -> VideoInfo:
     if fps <= 0:
         raise ProbeError("Could not determine the frame rate of this video.")
 
-    width = int(video.get("width") or 0)
-    height = int(video.get("height") or 0)
+    width = _safe_int(video.get("width"))
+    height = _safe_int(video.get("height"))
     if width <= 0 or height <= 0:
         raise ProbeError("Invalid video dimensions.")
+    if width > 16384 or height > 16384:
+        raise ProbeError(f"Video dimensions {width}x{height} are not supported.")
 
     rotation = _parse_rotation(video)
     if rotation in (90, 270):
         width, height = height, width
 
-    nb_frames = None
-    try:
-        nb_frames = int(video["nb_frames"])
-    except (KeyError, TypeError, ValueError):
-        nb_frames = None
-    if nb_frames is None and duration > 0:
-        nb_frames = int(round(duration * fps))
+    parsed_frames = _safe_int(video.get("nb_frames"), 0)
+    nb_frames = parsed_frames if parsed_frames > 0 else None
+
+    # Some containers omit format duration (or report N/A). Derive it from the
+    # frame count when possible, and fail with a clear message otherwise instead
+    # of silently pretending the clip is zero seconds long.
+    if duration <= 0 and nb_frames:
+        duration = nb_frames / fps
+    if duration <= 0:
+        raise ProbeError("Could not determine the duration of this video (metadata is missing).")
+    if nb_frames is None:
+        nb_frames = max(1, int(round(duration * fps)))
 
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
-    duration = duration if duration > 0 else 0.0
+    audio_channels = _safe_int((audio or {}).get("channels"), 0) or None
+    audio_sample_rate = _safe_int((audio or {}).get("sample_rate"), 0) or None
 
-    bitrate = None
-    try:
-        bitrate = int(fmt.get("bit_rate"))
-    except (TypeError, ValueError):
-        bitrate = None
+    bitrate = _safe_int(fmt.get("bit_rate"), 0) or _safe_int(video.get("bit_rate"), 0) or None
+    size_bytes = _safe_int(fmt.get("size"), 0)
+    if size_bytes <= 0:
+        try:
+            size_bytes = Path(path).stat().st_size
+        except OSError:
+            size_bytes = 0
 
     return VideoInfo(
         path=path,
@@ -162,13 +192,13 @@ def probe_video(path: str) -> VideoInfo:
         height=height,
         fps=fps,
         duration=duration,
-        size_bytes=int(fmt.get("size") or 0),
+        size_bytes=size_bytes,
         video_codec=codec,
         pix_fmt=video.get("pix_fmt"),
         has_audio=audio is not None,
         audio_codec=(audio or {}).get("codec_name"),
-        audio_channels=(audio or {}).get("channels"),
-        audio_sample_rate=int((audio or {}).get("sample_rate") or 0) or None,
+        audio_channels=audio_channels,
+        audio_sample_rate=audio_sample_rate,
         bitrate=bitrate,
         nb_frames=nb_frames,
         container=(fmt.get("format_name") or "").split(",")[0],

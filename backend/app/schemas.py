@@ -123,7 +123,8 @@ class SystemInfo(BaseModel):
     ffmpegPath: str | None = None
     rifeModelAvailable: bool
     rifeDevice: str | None = None
-    rifeProviders: list[str] = []
+    rifeError: str | None = None
+    rifeProviders: list[str] = Field(default_factory=list)
     rifeTiling: bool = False
     nvencAvailable: bool = False
     h264Encoder: str | None = None
@@ -133,5 +134,5 @@ class SystemInfo(BaseModel):
     gpuVramTotalMb: int | None = None
     gpuVramFreeMb: int | None = None
     freeDiskBytes: int = 0
-    limits: dict = {}
-    presets: dict = {}
+    limits: dict = Field(default_factory=dict)
+    presets: dict = Field(default_factory=dict)

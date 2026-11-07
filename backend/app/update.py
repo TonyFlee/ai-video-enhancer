@@ -40,6 +40,10 @@ SHA256_PATTERN = re.compile(r"SHA-?256[:=]\s*([0-9a-fA-F]{64})")
 CHECK_TTL_SECONDS = 6 * 3600.0    # success: re-check twice a day
 FAILURE_TTL_SECONDS = 10 * 60.0   # failure: retry soon, but not on every reload
 DOWNLOAD_CHUNK = 1024 * 1024
+# A setup bigger than this is not a plausible build of this app; refuse it
+# rather than filling the user's disk on a bogus/compromised release.
+MAX_INSTALLER_BYTES = 4 * 1024**3
+SAFE_INSTALLER_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def parse_version(text: str) -> tuple[int, int, int]:
@@ -57,6 +61,21 @@ def parse_version(text: str) -> tuple[int, int, int]:
 def is_newer(candidate: str, current: str) -> bool:
     """True when version ``candidate`` is strictly newer than ``current``."""
     return parse_version(candidate) > parse_version(current)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_safe_installer_url(url: str) -> bool:
+    """Only authenticated HTTPS URLs ending in .exe may ever be downloaded."""
+    lowered = (url or "").strip().lower()
+    if not lowered.startswith("https://"):
+        return False
+    return lowered.split("?", 1)[0].endswith(".exe")
 
 
 def _extract_sha256(body: str) -> str | None:
@@ -158,12 +177,22 @@ def _parse_release(payload: Any) -> UpdateInfo | None:
         logger.info("Release %s has no installer asset - ignoring it", tag)
         return None
 
+    url = str(asset.get("browser_download_url") or "")
+    if not _is_safe_installer_url(url):
+        logger.warning("Release %s installer URL is not a safe HTTPS .exe: %r", tag, url)
+        return None
+
+    size_bytes = _safe_int(asset.get("size"), 0)
+    if size_bytes > MAX_INSTALLER_BYTES:
+        logger.warning("Release %s installer is implausibly large (%d bytes)", tag, size_bytes)
+        return None
+
     body = str(payload.get("body") or "")
     return UpdateInfo(
         tag=tag,
         version=".".join(str(part) for part in parse_version(tag)),
-        url=str(asset.get("browser_download_url") or ""),
-        size_bytes=int(asset.get("size") or 0),
+        url=url,
+        size_bytes=size_bytes,
         notes=_strip_sha_line(body),
         published_at=str(payload.get("published_at") or ""),
         sha256=_extract_sha256(body),
@@ -181,6 +210,11 @@ def download_state() -> dict[str, Any]:
 
 def start_download(info: UpdateInfo) -> dict[str, Any]:
     """Kick off the asset download in a background thread (idempotent)."""
+    if not _is_safe_installer_url(info.url):
+        raise ValueError("The update URL is not a valid HTTPS installer.")
+    if info.size_bytes > MAX_INSTALLER_BYTES:
+        raise ValueError("The update is larger than the allowed installer size.")
+
     with _DOWNLOAD_LOCK:
         if _DOWNLOAD.state == "downloading":
             return _DOWNLOAD.as_dict()
@@ -189,7 +223,10 @@ def start_download(info: UpdateInfo) -> dict[str, Any]:
             tag=info.tag,
             total=info.size_bytes,
         )
-        target = _updates_dir() / Path(info.url.split("?")[0]).name
+        name = Path(info.url.split("?", 1)[0]).name
+        if not name or not SAFE_INSTALLER_NAME.fullmatch(name) or not name.lower().endswith(".exe"):
+            name = f"AI-Video-Enhancer-Setup-{info.version}.exe"
+        target = _updates_dir() / name
         _DOWNLOAD.path = str(target)
 
     thread = threading.Thread(
@@ -208,21 +245,34 @@ def _updates_dir() -> Path:
 def _run_download(info: UpdateInfo, target: Path) -> None:
     digest = hashlib.sha256()
     received = 0
+    temp = target.with_suffix(target.suffix + ".part")
     try:
         req = urlrequest.Request(
             info.url, headers={"User-Agent": f"AI-Video-Enhancer/{AVE_VERSION}"}
         )
         with urlrequest.urlopen(req, timeout=60) as response:  # noqa: S310 - fixed HTTPS host
-            declared = int(response.headers.get("Content-Length") or 0)
-            if declared:
-                _DOWNLOAD.total = declared
-            temp = target.with_suffix(target.suffix + ".part")
+            declared = _safe_int(response.headers.get("Content-Length"), 0)
+            if declared < 0 or declared > MAX_INSTALLER_BYTES:
+                raise ValueError("The server announced an implausible installer size.")
+            if info.size_bytes > 0 and declared > 0 and declared != info.size_bytes:
+                raise ValueError("The installer size does not match the release metadata.")
+            expected = info.size_bytes or declared
+            if expected:
+                _DOWNLOAD.total = expected
+            limit = min(MAX_INSTALLER_BYTES, expected) if expected else MAX_INSTALLER_BYTES
+
             with temp.open("wb") as handle:
                 while chunk := response.read(DOWNLOAD_CHUNK):
+                    received += len(chunk)
+                    if received > limit:
+                        raise ValueError("The installer is larger than expected; download aborted.")
                     handle.write(chunk)
                     digest.update(chunk)
-                    received += len(chunk)
                     _DOWNLOAD.received = received
+            if expected and received != expected:
+                raise ValueError(
+                    f"Download was truncated ({received} of {expected} bytes)."
+                )
             temp.replace(target)
 
         _DOWNLOAD.received = received
@@ -235,13 +285,30 @@ def _run_download(info: UpdateInfo, target: Path) -> None:
                 target.unlink(missing_ok=True)
         else:
             _DOWNLOAD.sha256_ok = None  # nothing published to verify against
+        if _DOWNLOAD.state == "ready":
+            _prune_installers(keep=target)
         logger.info("Update %s downloaded (%d bytes, sha ok=%s)", info.tag, received, _DOWNLOAD.sha256_ok)
     except Exception as exc:  # noqa: BLE001 - surface any network/disk failure
         logger.exception("Update download failed")
         _DOWNLOAD.state = "error"
         _DOWNLOAD.error = str(exc)
-        Path(str(target) + ".part").unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
         target.unlink(missing_ok=True)
+
+
+def _prune_installers(*, keep: Path | None) -> None:
+    """Remove old setup files so repeated updates do not fill storage."""
+    directory = _updates_dir()
+    for path in directory.iterdir():
+        try:
+            if not path.is_file():
+                continue
+            if keep is not None and path.resolve() == keep.resolve():
+                continue
+            if path.suffix.lower() in (".exe", ".part"):
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 def ready_installer() -> Path | None:
@@ -249,10 +316,15 @@ def ready_installer() -> Path | None:
     if _DOWNLOAD.state != "ready" or not _DOWNLOAD.path:
         return None
     path = Path(_DOWNLOAD.path)
-    return path if path.is_file() else None
+    if not path.is_file() or path.suffix.lower() != ".exe" or path.stat().st_size <= 0:
+        return None
+    return path
 
 
 def launch_installer(path: Path) -> None:
     """Open the setup wizard (visible - not CREATE_NO_WINDOW). Windows only."""
+    path = Path(path)
+    if not path.is_file() or path.suffix.lower() != ".exe" or path.stat().st_size <= 0:
+        raise OSError(f"Refusing to launch a missing or invalid installer: {path}")
     logger.info("Launching updater: %s", path)
     os.startfile(str(path))  # noqa: S606 - deliberate: the user must see the wizard

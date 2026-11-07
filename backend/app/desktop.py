@@ -40,7 +40,18 @@ import webbrowser
 from pathlib import Path
 
 WINDOW_TITLE = "AI Video FPS Enhancer"
-DEFAULT_PORT = int(os.environ.get("AVE_PORT", "8123"))
+
+
+def _parse_port(raw: str | None, default: int = 8123) -> int:
+    """A malformed AVE_PORT must not crash startup with a ValueError."""
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+    return value if 1 <= value <= 65535 else default
+
+
+DEFAULT_PORT = _parse_port(os.environ.get("AVE_PORT"))
 
 # The WebView2 Runtime's install key (Evergreen bootstrapper GUID); combined with
 # the Software / Software\WOW6432Node prefixes below.

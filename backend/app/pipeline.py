@@ -13,12 +13,11 @@ Design notes
 from __future__ import annotations
 
 import logging
-import math
 import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +52,7 @@ class PipelineResult:
     interpolation_factor: float
     interpolated_frames: int
     audio_preserved: bool
+    bitrate: int | None = None
 
 
 @dataclass
@@ -233,6 +233,11 @@ class VideoPipeline:
         on_progress,
     ) -> PipelineResult:
         validate_settings(info, settings)
+        # Tiling decisions are per job (they depend on this frame size and the
+        # VRAM that happens to be free right now); do not inherit them forever.
+        begin_job = getattr(self.engine, "begin_job", None)
+        if begin_job is not None:
+            begin_job()
 
         width, height, fit_mode = resolve_geometry(info, settings)
         factor = plan_factor(info, settings)
@@ -345,7 +350,9 @@ class VideoPipeline:
 
             prev = read_frame()
             if prev is None:
-                raise PipelineError("Could not decode any frames from this video.")
+                dec_rc = _wait_with_cancel(decoder, cancel_event, timeout=30)
+                detail = dec_err.tail() or f"ffmpeg decode exited with code {dec_rc}"
+                raise PipelineError(f"Could not decode any frames from this video. {detail}".strip())
 
             src_index = 0
             while True:
@@ -392,8 +399,14 @@ class VideoPipeline:
                 processed=total_out, total=total_out, fps=0.0, eta=0.0,
             ))
 
-            enc_rc = encoder_proc.wait(timeout=1800)
-            decoder.wait(timeout=60)
+            # Wait in small slices so cancelling during muxing (which can take a
+            # while on long videos) is honoured instead of blocking for 30 min.
+            enc_rc = _wait_with_cancel(encoder_proc, cancel_event, timeout=1800)
+            dec_rc = _wait_with_cancel(decoder, cancel_event, timeout=60)
+            if dec_rc != 0:
+                raise PipelineError(
+                    "Decoding failed: " + (dec_err.tail() or f"ffmpeg exited with code {dec_rc}")
+                )
             if enc_rc != 0:
                 raise PipelineError(
                     "Encoding failed: " + (enc_err.tail() or f"ffmpeg exited with code {enc_rc}")
@@ -427,7 +440,26 @@ class VideoPipeline:
             interpolation_factor=factor,
             interpolated_frames=interpolated,
             audio_preserved=enhanced.has_audio,
+            bitrate=enhanced.bitrate,
         )
+
+
+def _wait_with_cancel(
+    proc: subprocess.Popen,
+    cancel_event: threading.Event,
+    *,
+    timeout: float,
+    poll_interval: float = 0.2,
+) -> int:
+    """Wait for a child process while honouring the job's cancellation flag."""
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None:
+        if cancel_event.is_set():
+            raise Cancelled()
+        if time.monotonic() >= deadline:
+            raise PipelineError("FFmpeg did not finish in time.")
+        time.sleep(poll_interval)
+    return int(proc.returncode or 0)
 
 
 def _terminate(*procs: subprocess.Popen) -> None:

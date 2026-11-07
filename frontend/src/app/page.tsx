@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import ComparePlayer from "@/components/ComparePlayer";
 import Dropzone from "@/components/Dropzone";
@@ -36,6 +36,9 @@ import { DEFAULT_SETTINGS, type JobSettings, type JobState, type SystemInfo, typ
 
 type Phase = "idle" | "analyzing" | "ready" | "uploading" | "processing" | "done" | "error" | "cancelled";
 
+/** The File System Access API never changes during a page's lifetime. */
+const subscribeToNothing = () => () => {};
+
 export default function Home() {
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [file, setFile] = useState<File | null>(null);
@@ -49,20 +52,36 @@ export default function Home() {
   const [outFolder, setOutFolder] = useState<FsDirectoryHandle | null>(null);
   const [saving, setSaving] = useState(false);
   const [savePercent, setSavePercent] = useState<number | null>(null);
-  // Feature-detected after mount: the File System Access API only exists in the
-  // browser, so deciding during render would make the server HTML and the first
-  // client render differ (React hydration mismatch).
-  const [supportsFolders, setSupportsFolders] = useState(false);
+  // Feature-detected without setState-in-effect: the server snapshot is false,
+  // the client snapshot reflects the browser. This avoids both a hydration
+  // mismatch and the extra render the old useEffect caused (and the lint error).
+  const supportsFolders = useSyncExternalStore(
+    subscribeToNothing,
+    supportsFolderPicker,
+    () => false,
+  );
 
   const abortRef = useRef<AbortController | null>(null);
   const pollRef = useRef<number | null>(null);
-  const jobIdRef = useRef<string | null>(null);
+  const pollGeneration = useRef(0);
 
   // -------------------------------------------------- remembered output folder
   useEffect(() => {
-    setSupportsFolders(supportsFolderPicker());
     let cancelled = false;
-    void loadFolder().then((handle) => {
+    void loadFolder().then(async (handle) => {
+      if (!handle || cancelled) return;
+      // A handle can outlive its permission grant (browser restart, profile
+      // change). A permanently denied handle is stale; drop it instead of
+      // showing "Save to <folder>" for a destination that will always fail.
+      try {
+        const state = await handle.queryPermission({ mode: "readwrite" });
+        if (state === "denied") {
+          await persistFolder(null);
+          return;
+        }
+      } catch {
+        /* queryPermission unsupported: keep the handle and re-ask on save */
+      }
       if (!cancelled) setOutFolder(handle);
     });
     return () => {
@@ -150,33 +169,48 @@ export default function Home() {
 
   // -------------------------------------------------------- job status poll
   const stopPolling = useCallback(() => {
+    // Bump the generation first: a request that is already in flight when the
+    // user resets or cancels must not schedule another poll afterwards.
+    pollGeneration.current += 1;
     if (pollRef.current !== null) {
-      window.clearInterval(pollRef.current);
+      window.clearTimeout(pollRef.current);
       pollRef.current = null;
     }
   }, []);
 
-  useEffect(() => stopPolling, [stopPolling]);
+  useEffect(() => () => stopPolling(), [stopPolling]);
 
   const startPolling = useCallback(
     (jobId: string) => {
       stopPolling();
-      pollRef.current = window.setInterval(async () => {
+      const generation = pollGeneration.current;
+
+      // A recursive timeout (not setInterval) guarantees requests never overlap:
+      // the next poll is scheduled only after the previous one has resolved.
+      const tick = async () => {
+        if (generation !== pollGeneration.current) return;
         try {
           const state = await getJob(jobId);
+          if (generation !== pollGeneration.current) return;
           setJob(state);
           if (state.status === "done") {
             setPhase("done");
             stopPolling();
-          } else if (state.status === "error") {
+            return;
+          }
+          if (state.status === "error") {
             setError(state.error ?? "Processing failed.");
             setPhase("error");
             stopPolling();
-          } else if (state.status === "cancelled") {
+            return;
+          }
+          if (state.status === "cancelled") {
             setPhase("cancelled");
             stopPolling();
+            return;
           }
         } catch (pollError) {
+          if (generation !== pollGeneration.current) return;
           if (pollError instanceof ApiError && pollError.status === 404) {
             // The job no longer exists (backend restarted or the job expired).
             // Drop the stale card and return to a state where the selected file can
@@ -189,8 +223,14 @@ export default function Home() {
           }
           setError(pollError instanceof Error ? pollError.message : "Lost connection to the backend.");
           stopPolling();
+          return;
         }
-      }, 700);
+        if (generation === pollGeneration.current) {
+          pollRef.current = window.setTimeout(tick, 700);
+        }
+      };
+
+      pollRef.current = window.setTimeout(tick, 700);
     },
     [stopPolling],
   );
@@ -238,7 +278,6 @@ export default function Home() {
       });
       setJob(state);
       setUploadPercent(null);
-      jobIdRef.current = state.id;
       setPhase("processing");
       startPolling(state.id);
     } catch (uploadError) {

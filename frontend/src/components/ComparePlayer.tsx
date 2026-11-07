@@ -9,10 +9,26 @@ interface ComparePlayerProps {
   enhancedLabel?: string;
 }
 
+/** Clamp a playback rate to what browsers reliably support. */
+function clampRate(value: number): number {
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(16, Math.max(0.0625, value));
+}
+
+function formatClock(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "0:00";
+  const total = Math.floor(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 /**
- * Two synchronised players: play/pause/seek/mute is mirrored so both videos show the
- * same moment. The enhanced clip is the one with real interpolated frames, so the
- * difference in smoothness is visible when scrubbing or pausing.
+ * Two synchronised players: play/pause/seek/mute is mirrored so both videos show
+ * the same moment. The clips can have different durations (slow motion makes the
+ * enhanced video longer), so positions are mapped by duration ratio rather than
+ * by absolute seconds. The enhanced clip is the one with real interpolated
+ * frames, so the difference in smoothness is visible when scrubbing or pausing.
  */
 export default function ComparePlayer({
   originalSrc,
@@ -23,60 +39,132 @@ export default function ComparePlayer({
   const originalRef = useRef<HTMLVideoElement>(null);
   const enhancedRef = useRef<HTMLVideoElement>(null);
   const syncingRef = useRef(false);
+  const durationsRef = useRef({ original: 0, enhanced: 0 });
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(true);
   const [current, setCurrent] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [enhancedDuration, setEnhancedDuration] = useState(0);
   const [rate, setRate] = useState(1);
 
   const playerA = () => originalRef.current;
   const playerB = () => enhancedRef.current;
 
-  const syncFrom = useCallback((source: HTMLVideoElement | null) => {
-    if (!source || syncingRef.current) return;
-    syncingRef.current = true;
-    const other = source === playerA() ? playerB() : playerA();
-    if (other && Math.abs(other.currentTime - source.currentTime) > 0.05) {
-      other.currentTime = source.currentTime;
+  /** enhanced seconds per original second (1 for a normal export, 2 for 0.5x slow-mo). */
+  const durationRatio = useCallback(() => {
+    const aDuration = playerA()?.duration || durationsRef.current.original;
+    const bDuration = playerB()?.duration || durationsRef.current.enhanced;
+    if (
+      Number.isFinite(aDuration) &&
+      Number.isFinite(bDuration) &&
+      aDuration > 0 &&
+      bDuration > 0
+    ) {
+      return bDuration / aDuration;
     }
-    setCurrent(source.currentTime);
-    setDuration(source.duration || 0);
-    syncingRef.current = false;
+    return 1;
   }, []);
+
+  const applyRates = useCallback(() => {
+    const ratio = durationRatio();
+    const a = playerA();
+    const b = playerB();
+    if (a) a.playbackRate = clampRate(rate);
+    if (b) b.playbackRate = clampRate(rate * ratio);
+  }, [durationRatio, rate]);
+
+  const syncFrom = useCallback(
+    (source: HTMLVideoElement | null) => {
+      if (!source || syncingRef.current) return;
+      syncingRef.current = true;
+      const a = playerA();
+      const b = playerB();
+      const ratio = durationRatio();
+
+      if (source === b && a) {
+        const target = ratio > 0 ? source.currentTime / ratio : source.currentTime;
+        if (Math.abs(a.currentTime - target) > 0.05) a.currentTime = target;
+        setCurrent(target);
+      } else {
+        if (b) {
+          const target = source.currentTime * ratio;
+          if (Math.abs(b.currentTime - target) > 0.05) b.currentTime = target;
+        }
+        setCurrent(source.currentTime);
+      }
+      setDuration(a?.duration || source.duration || 0);
+      syncingRef.current = false;
+    },
+    [durationRatio],
+  );
 
   useEffect(() => {
     const a = playerA();
     const b = playerB();
     if (!a || !b) return;
 
+    const readDurations = () => {
+      durationsRef.current = {
+        original: Number.isFinite(a.duration) ? a.duration : 0,
+        enhanced: Number.isFinite(b.duration) ? b.duration : 0,
+      };
+      setDuration(durationsRef.current.original);
+      setEnhancedDuration(durationsRef.current.enhanced);
+      applyRates();
+    };
     const onTime = () => syncFrom(a);
-    const onMeta = () => setDuration(a.duration || 0);
     const onPlay = () => {
       setPlaying(true);
+      applyRates();
       void b.play().catch(() => undefined);
     };
     const onPause = () => {
       setPlaying(false);
       b.pause();
     };
+    const onEnded = () => {
+      // Either stream ending means the comparison is over; pause both instead
+      // of letting the other one keep running (or spin at the end).
+      setPlaying(false);
+      a.pause();
+      b.pause();
+      if (Number.isFinite(a.duration)) setCurrent(a.duration);
+      if (Number.isFinite(a.duration)) a.currentTime = a.duration;
+      if (Number.isFinite(b.duration)) b.currentTime = b.duration;
+    };
 
     a.addEventListener("timeupdate", onTime);
-    a.addEventListener("loadedmetadata", onMeta);
+    a.addEventListener("loadedmetadata", readDurations);
+    a.addEventListener("durationchange", readDurations);
     a.addEventListener("play", onPlay);
     a.addEventListener("pause", onPause);
+    a.addEventListener("ended", onEnded);
+    b.addEventListener("loadedmetadata", readDurations);
+    b.addEventListener("durationchange", readDurations);
+    b.addEventListener("ended", onEnded);
+
+    // Metadata may already be available when the effect runs (cached videos).
+    readDurations();
+
     return () => {
       a.removeEventListener("timeupdate", onTime);
-      a.removeEventListener("loadedmetadata", onMeta);
+      a.removeEventListener("loadedmetadata", readDurations);
+      a.removeEventListener("durationchange", readDurations);
       a.removeEventListener("play", onPlay);
       a.removeEventListener("pause", onPause);
+      a.removeEventListener("ended", onEnded);
+      b.removeEventListener("loadedmetadata", readDurations);
+      b.removeEventListener("durationchange", readDurations);
+      b.removeEventListener("ended", onEnded);
     };
-  }, [syncFrom]);
+  }, [applyRates, syncFrom]);
 
   const togglePlay = () => {
     const a = playerA();
     const b = playerB();
     if (!a || !b) return;
     if (a.paused) {
+      applyRates();
       void a.play().catch(() => undefined);
       void b.play().catch(() => undefined);
       setPlaying(true);
@@ -91,15 +179,17 @@ export default function ComparePlayer({
     const a = playerA();
     const b = playerB();
     if (!a || !b) return;
+    const ratio = durationRatio();
     a.currentTime = value;
-    b.currentTime = value;
+    b.currentTime = Math.min(value * ratio, b.duration || value * ratio);
     setCurrent(value);
   };
 
   const changeRate = (value: number) => {
     setRate(value);
-    [playerA(), playerB()].forEach((player) => {
-      if (player) player.playbackRate = value;
+    const ratio = durationRatio();
+    [playerA(), playerB()].forEach((player, index) => {
+      if (player) player.playbackRate = clampRate(index === 0 ? value : value * ratio);
     });
   };
 
@@ -118,6 +208,7 @@ export default function ComparePlayer({
   };
 
   const progressPercent = duration > 0 ? (current / duration) * 100 : 0;
+  const slowMotionRatio = duration > 0 && enhancedDuration > 0 ? enhancedDuration / duration : 1;
 
   return (
     <div className="space-y-3">
@@ -203,7 +294,10 @@ export default function ComparePlayer({
             />
             <div className="mt-1 flex justify-between text-[11px] text-zinc-500">
               <span>{formatClock(current)}</span>
-              <span>{formatClock(duration)}</span>
+              <span>
+                {formatClock(duration)}
+                {slowMotionRatio > 1.01 ? ` · enhanced ${formatClock(enhancedDuration)}` : ""}
+              </span>
             </div>
           </div>
 
@@ -234,12 +328,4 @@ export default function ComparePlayer({
       </div>
     </div>
   );
-}
-
-function formatClock(seconds: number): string {
-  if (!Number.isFinite(seconds)) return "0:00";
-  const total = Math.floor(seconds);
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return `${m}:${String(s).padStart(2, "0")}`;
 }

@@ -25,6 +25,7 @@ from .config import (
     AVE_VERSION,
     MAX_DURATION_SECONDS,
     MAX_UPLOAD_BYTES,
+    RIFE_MODEL_PATH,
     UPLOADS_DIR,
     JOB_TTL_HOURS,
     SERVE_UI,
@@ -65,8 +66,12 @@ async def lifespan(app: FastAPI):
     thread = threading.Thread(target=_cleanup_loop, name="cleanup", daemon=True)
     thread.start()
     logger.info("AI Video Enhancer backend ready (storage=%s)", UPLOADS_DIR.parent)
-    yield
-    stop.set()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        manager.shutdown()
 
 
 app = FastAPI(title="AI Video Enhancer API", version=AVE_VERSION, lifespan=lifespan)
@@ -95,6 +100,39 @@ def _get_job_or_404(job_id: str):
     return job
 
 
+def _parse_range_header(value: str, file_size: int) -> tuple[int, int] | None:
+    """Parse ``bytes=start-end`` / ``bytes=start-`` / ``bytes=-suffix``.
+
+    Returns a clamped inclusive byte range, or ``None`` when the header is
+    malformed or unsatisfiable. A malformed ``Range`` header must never turn
+    into a 500 (``int("abc")`` used to escape the route).
+    """
+    match = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", value or "")
+    if not match or file_size <= 0:
+        return None
+    start_raw, end_raw = match.groups()
+    if not start_raw and not end_raw:
+        return None
+    try:
+        if start_raw:
+            start = int(start_raw)
+            end = int(end_raw) if end_raw else file_size - 1
+        else:
+            suffix = int(end_raw)
+            if suffix <= 0:
+                return None
+            start = max(file_size - suffix, 0)
+            end = file_size - 1
+    except (TypeError, ValueError):
+        return None
+    if start < 0 or start >= file_size:
+        return None
+    end = min(end, file_size - 1)
+    if end < start:
+        return None
+    return start, end
+
+
 def _range_response(path: Path, request: Request, *, as_attachment: bool, download_name: str | None) -> Response:
     """Serve a file with HTTP range support so <video> can seek."""
     file_size = path.stat().st_size
@@ -119,20 +157,10 @@ def _range_response(path: Path, request: Request, *, as_attachment: bool, downlo
 
         return StreamingResponse(full(), media_type=media_type, headers=headers)
 
-    match = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
-    if not match:
-        raise HTTPException(status_code=416, detail="Invalid Range header")
-    start_raw, end_raw = match.groups()
-    if start_raw:
-        start = int(start_raw)
-        end = int(end_raw) if end_raw else file_size - 1
-    else:  # suffix range: bytes=-N
-        length = int(end_raw or 0)
-        start = max(file_size - length, 0)
-        end = file_size - 1
-    end = min(end, file_size - 1)
-    if start > end or start >= file_size:
+    parsed = _parse_range_header(range_header, file_size)
+    if parsed is None:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+    start, end = parsed
 
     length = end - start + 1
     headers["Content-Length"] = str(length)
@@ -197,8 +225,12 @@ def system_info() -> SystemInfo:
     return SystemInfo(
         ffmpegAvailable=caps["ffmpegFound"],
         ffmpegPath=resolve_ffmpeg(),
-        rifeModelAvailable=engine is not None,
+        # Availability means "the model file is installed"; the engine may still
+        # be warming up in the background. Reporting `engine is not None` made a
+        # freshly started app claim the model was missing.
+        rifeModelAvailable=RIFE_MODEL_PATH.is_file(),
         rifeDevice=engine.device if engine else None,
+        rifeError=engine_error,
         rifeProviders=engine.providers if engine else [],
         rifeTiling=engine.tiling if engine else False,
         nvencAvailable=caps["nvencUsable"],
@@ -248,9 +280,15 @@ async def probe_upload(file: UploadFile = File(...)) -> dict:
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail="File is larger than the upload limit.")
                 handle.write(chunk)
-        info = probe_video(str(tmp_path))
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        try:
+            info = probe_video(str(tmp_path))
+        except ProbeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         tmp_path.unlink(missing_ok=True)
+        await file.close()
     return {"original": info.as_dict()}
 
 
@@ -290,47 +328,46 @@ async def create_job(
                         detail=f"File exceeds the {MAX_UPLOAD_BYTES / 1024**3:.1f} GB upload limit.",
                     )
                 handle.write(chunk)
-    except HTTPException:
+
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        # Validate the video before queueing the heavy work.
+        try:
+            info = probe_video(str(upload_path))
+        except ProbeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        from .pipeline import PipelineError, validate_settings
+
+        try:
+            validate_settings(info, job_settings)
+        except PipelineError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if info.duration > MAX_DURATION_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video is {info.duration / 60:.1f} min; the limit is {MAX_DURATION_SECONDS / 60:.0f} min.",
+            )
+
+        try:
+            choose_encoder(job_settings.codec, prefer_gpu=job_settings.prefer_gpu)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail=f"No usable {job_settings.codec} encoder: {exc}"
+            ) from exc
+
+        state = manager.create_job(
+            job_id, job_settings, upload_path, source_name=Path(filename).stem, original=info.as_dict()
+        )
+    except BaseException:
+        # Any failure (including a client disconnect) must not leave a partial
+        # upload behind - this used to clean up only HTTPException.
         upload_path.unlink(missing_ok=True)
         raise
     finally:
         await file.close()
-
-    if size == 0:
-        upload_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-    # Validate the video before queueing the heavy work.
-    try:
-        info = probe_video(str(upload_path))
-    except ProbeError as exc:
-        upload_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    from .pipeline import PipelineError, validate_settings
-
-    try:
-        validate_settings(info, job_settings)
-    except PipelineError as exc:
-        upload_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if info.duration > MAX_DURATION_SECONDS:
-        upload_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Video is {info.duration / 60:.1f} min; the limit is {MAX_DURATION_SECONDS / 60:.0f} min.",
-        )
-
-    try:
-        choose_encoder(job_settings.codec, prefer_gpu=job_settings.prefer_gpu)
-    except Exception as exc:  # noqa: BLE001
-        upload_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=f"No usable {job_settings.codec} encoder: {exc}") from exc
-
-    state = manager.create_job(
-        job_id, job_settings, upload_path, source_name=Path(filename).stem, original=info.as_dict()
-    )
     return state
 
 
@@ -375,7 +412,6 @@ def download(job_id: str, request: Request) -> Response:
     job = _get_job_or_404(job_id)
     if job.state.status != "done" or not job.output_path.exists():
         raise HTTPException(status_code=409, detail="Enhanced video is not ready yet.")
-    info = job.state.original or {}
     stem = Path(_sanitize_filename(job.source_name or "video")).stem or "video"
     fps = job.state.enhanced.fps if job.state.enhanced else None
     suffix = f"_{fps:g}fps" if fps else ""
@@ -415,7 +451,10 @@ def update_download() -> dict:
     info = update.check_for_update()
     if info is None:
         raise HTTPException(status_code=409, detail="No update available (or the check failed offline).")
-    return update.start_download(info)
+    try:
+        return update.start_download(info)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/update/install")

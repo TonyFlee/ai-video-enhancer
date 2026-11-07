@@ -25,7 +25,7 @@ network. The pipeline never copies a frame to fake a higher frame rate, and it n
 | Interpolation | 30/24 → 60 fps, 30 → 120 fps, 60 → 120 fps, arbitrary 30/60/120/240 targets |
 | Slow motion | 0.25× / 0.5× / 0.75× smooth slow motion, audio time-stretched to stay in sync |
 | TikTok presets | 1080 × 1920 (9:16) for TikTok / Reels / Shorts, fill-and-crop or fit-and-pad, keep original size, or a **custom frame** (64–4096 px, e.g. 720 × 1280 — roughly twice as fast to interpolate) |
-| Export | H.264 or H.265 MP4, AAC audio, NVENC GPU encoding when available, CQ/CRF or explicit bitrate |
+| Export | H.264 or H.265 MP4, AAC audio, NVENC GPU encoding when available, CQ/CRF or explicit bitrate. Unavailable codecs are disabled in the UI with the detected CPU/GPU encoder named |
 | Monitoring | Live progress, processed/total frames, interpolation speed, ETA, elapsed time, cancel button |
 | Processing detail | **Faster / Fastest** modes: the AI interpolates a smaller frame (75 % / 50 %) and the encoder upscales — same output resolution and frame rate, ~1.8× / ~3–4× quicker, slightly softer motion detail |
 | Save location | Pick an output folder once (**Chrome/Edge**) and finished videos are streamed straight into it with a save progress bar; otherwise they go to the normal browser download folder |
@@ -211,6 +211,20 @@ npm run dev
 | POST | `/api/update/install` | Launch the downloaded setup (visible wizard) |
 
 Interactive docs: <http://127.0.0.1:8000/docs>
+
+### Frontend checks
+
+```powershell
+cd "D:\Project\AI Video Enhancer\frontend"
+npm run lint       # ESLint (Next.js core web vitals + TypeScript rules)
+npm run typecheck  # tsc --noEmit
+npm test           # Vitest + Testing Library (jsdom)
+npm run build      # production build
+```
+
+The unit/component tests cover formatters, API error handling, upload validation, the settings
+panel (including encoder availability) and the synchronised comparison player. Run the backend
+suite from `backend` with `.\.venv\Scripts\python.exe -m pytest -q`.
 
 ---
 
@@ -477,6 +491,10 @@ Environment variables (all optional):
 | `AVE_UPDATE_API` | `https://api.github.com/repos/{repo}/releases/latest` | Override the release-check URL (development/testing; a literal URL without `{repo}` is fine) |
 | `AVE_CPU_ONLY` | off | Build-time only: `build_windows_app.ps1 -CpuOnly` sets it to drop the CUDA DLLs |
 
+Malformed numeric/boolean environment values fall back to the documented default instead of
+crashing at import time (`AVE_PORT` outside 1–65535 also falls back to 8123). `AVE_TILE_HEIGHT`
+is clamped to a minimum of 96 px so the tile overlap cannot dominate the frame.
+
 > `AVE_PROXY_MAX_BODY` trades memory for upload size: Next.js buffers each proxied request body in RAM,
 > so a multi-GB upload needs roughly that much free memory too. Jobs, streaming and downloads are unaffected.
 
@@ -509,7 +527,9 @@ Details worth knowing:
   factors (24 → 60 fps = 2.5×) the interpolator is queried at the correct fractional timesteps instead of
   duplicating frames, so the audio never drifts.
 - **Slow motion.** `factor = target / (speed × source)`; the encoder writes at `target` fps and audio is
-  time-stretched with `atempo`, so a 0.5× clip is twice as long with synchronised audio.
+  time-stretched with `atempo`, so a 0.5× clip is twice as long with synchronised audio. Speeds below
+  0.5× are split into chained `atempo=0.5` stages (FFmpeg rejects a single `atempo=0.25`), and the audio
+  is padded with silence so `-shortest` cannot trim the final video frames.
 - **Geometry first.** Scale/crop/pad happen in the decode filter chain, so RIFE only ever sees the final
   output resolution (cheaper and consistent with the exported dimensions).
 - **Processing detail (speed vs detail).** `computeScale` (UI: *Processing detail*) decouples the size the AI
@@ -528,9 +548,16 @@ Details worth knowing:
   `cancelling` until the loop actually stops, then `cancelled`. The killed encoder is reaped and the
   partial MP4 is removed (retried, because Windows keeps the file handle open until the process exits).
   A job still waiting for the single GPU slot settles to `cancelled` immediately instead of waiting for
-  the running job to release it. Frame size/orientation is fixed when a job starts, so a running job
+  the running job to release it. Finalisation waits are polled too, so cancelling during muxing does not
+  block for the encoder timeout. Frame size/orientation is fixed when a job starts, so a running job
   cannot be re-targeted — cancel and start a new one with the new settings.
-- **Cleanup.** Outputs/uploads are removed after `AVE_JOB_TTL_HOURS`, and `storage/` is purged on startup.
+- **Encoding levels.** CPU H.264 output does not pin an x264 level: 1080 × 1920 at 120 fps exceeds
+  level 4.2, and pinning it makes libx264 fail or silently reduce quality.
+- **Strict input checks.** `ffprobe` metadata with missing duration, absurd frame rates or oversized
+  dimensions is rejected with a clear 400 instead of producing a broken job. Malformed HTTP `Range`
+  headers return `416`, never `500`.
+- **Cleanup.** Outputs/uploads/temp files are removed after `AVE_JOB_TTL_HOURS`, `storage/` is purged on
+  startup, and active jobs are cancelled on server shutdown so nothing keeps writing after the app exits.
 
 ---
 
@@ -581,7 +608,7 @@ that only happens when new frames were actually generated.
 | `scripts/bench_one.py` | One RIFE configuration in a fresh process (model, size, tile height) |
 | `scripts/bench_processing_detail.py` | Full-detail vs *Fastest* processing on the same clip — proves the speed-up and that the output geometry is unchanged |
 | `scripts/fp16_variants.py` | FP16 conversion variants |
-| `tests/test_units.py` | Unit suite: `python -m pytest -q` |
+| `tests/test_units.py` | Backend unit + API suite: `python -m pytest -q` |
 | `scripts/build_windows_app.ps1` | Builds the packaged desktop app (`dist\AI Video Enhancer\AI Video Enhancer.exe`) end to end |
 | `scripts/build_installer.ps1` | Wraps the packaged app in a Windows setup program (`installer_output\AI-Video-Enhancer-Setup-<version>.exe`) with Inno Setup — see §6 *Distribute it* |
 | `packaging/make_icon.py` | Generates `packaging/app.ico` (the exe, the shortcuts and the installer all use it) without needing an imaging library |
@@ -609,14 +636,16 @@ AI Video Enhancer/
 │  ├─ packaging/        # PyInstaller spec, entry point, installer.iss, EULA.txt, make_icon.py, bundled bin/ (ffmpeg)
 │  ├─ models/           # RIFE_fp32_timestep.onnx (downloaded; + optional midpoint/fp16)
 │  ├─ scripts/          # download_models, api_test, desktop_app_test, verify_no_console_windows, e2e_test, build_windows_app.ps1, build_installer.ps1, …
-│  ├─ tests/            # unit suite (pytest)
+│  ├─ tests/            # backend unit + API suite (pytest)
 │  ├─ storage/          # uploads, outputs, temp (auto-cleaned)
 │  └─ requirements.txt
 ├─ frontend/
 │  ├─ src/app/          # layout, dashboard page, global styles
-│  ├─ src/components/   # Dropzone, SettingsPanel, ProgressPanel, ComparePlayer, UpdateBanner, …
-│  ├─ src/lib/          # api client, types, formatters
+│  ├─ src/components/   # Dropzone, SettingsPanel, ProgressPanel, ComparePlayer, UpdateBanner, … (+ *.test.tsx)
+│  ├─ src/lib/          # api client, types, formatters, folder saving (+ *.test.ts)
+│  ├─ src/test/         # Vitest setup (jsdom + Testing Library)
 │  ├─ out/              # static export used by the packaged app (NEXT_EXPORT=1)
+│  ├─ vitest.config.mts # frontend test runner config
 │  └─ next.config.ts    # /api proxy to FastAPI (dev) / static export (desktop)
 └─ README.md
 ```

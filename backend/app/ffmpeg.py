@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import subprocess
 from dataclasses import dataclass
 
@@ -81,6 +82,11 @@ def detect_capabilities() -> dict:
 def choose_encoder(codec: str, prefer_gpu: bool = True) -> EncoderChoice:
     """Pick the best available encoder for the requested codec."""
     caps = detect_capabilities()
+    if not caps["ffmpegFound"]:
+        raise FfmpegError(
+            "FFmpeg was not found. Install it and make sure both ffmpeg and ffprobe are on PATH, "
+            "or set AVE_FFMPEG / AVE_FFPROBE."
+        )
     codec = codec.lower()
     if codec in ("h265", "hevc"):
         if prefer_gpu and caps["hevcNvenc"] and caps["nvencUsable"]:
@@ -207,7 +213,10 @@ def build_encode_command(
         else:
             cmd += ["-cq", str(quality_cq or 19), "-b:v", "0"]
     elif encoder.kind == "x264":
-        cmd += ["-preset", X264_PRESET, "-profile:v", "high", "-level", "4.2"]
+        # Do not pin an x264 level: the output size/FPS can exceed level 4.2
+        # (e.g. 1080x1920 at 120 fps), and libx264 then refuses or silently
+        # lowers quality to satisfy the cap. The encoder chooses a safe level.
+        cmd += ["-preset", X264_PRESET, "-profile:v", "high"]
         if video_bitrate:
             cmd += ["-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", _double(video_bitrate)]
         else:
@@ -229,9 +238,12 @@ def build_encode_command(
     if has_audio:
         filters = list(extra_audio_filters or [])
         if abs(audio_speed - 1.0) > 1e-6:
-            filters.append(f"atempo={audio_speed:.6f}")
-        if filters:
-            cmd += ["-af", ",".join(filters)]
+            filters.extend(_atempo_filters(audio_speed))
+        # Pad short audio with silence. Without this, "-shortest" stops at the
+        # end of the audio track and can truncate the last video frames (most
+        # visible in slow motion, where audio is time-stretched).
+        filters.append("apad")
+        cmd += ["-af", ",".join(filters)]
         cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000"]
 
     cmd += [
@@ -242,6 +254,34 @@ def build_encode_command(
         cmd += ["-shortest"]
     cmd += ["-f", "mp4", output_path]
     return cmd
+
+
+def _atempo_filters(speed: float) -> list[str]:
+    """Split a playback speed into chained ``atempo`` filters.
+
+    FFmpeg's ``atempo`` filter accepts roughly 0.5–2.0 per instance, so 0.25x
+    (slow motion) must be expressed as ``atempo=0.5,atempo=0.5``. Passing
+    ``atempo=0.25`` directly makes FFmpeg reject the filter and fail the job.
+    """
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        return []
+    if not math.isfinite(speed) or speed <= 0:
+        return []
+    if abs(speed - 1.0) < 1e-9:
+        return []
+
+    factors: list[float] = []
+    remaining = speed
+    while remaining < 0.5 - 1e-9:
+        factors.append(0.5)
+        remaining /= 0.5
+    while remaining > 2.0 + 1e-9:
+        factors.append(2.0)
+        remaining /= 2.0
+    factors.append(min(2.0, max(0.5, remaining)))
+    return [f"atempo={factor:.6f}" for factor in factors]
 
 
 def _double(bitrate: str) -> str:

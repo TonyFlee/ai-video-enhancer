@@ -12,6 +12,7 @@ from pathlib import Path
 from .config import (
     JOB_TTL_HOURS,
     OUTPUTS_DIR,
+    TMP_DIR,
     UPLOADS_DIR,
     ensure_dirs,
 )
@@ -68,7 +69,13 @@ class JobManager:
             if self._engine is None:
                 from .config import RIFE_MODEL_PATH
 
-                self._engine = RifeEngine(RIFE_MODEL_PATH, prefer_gpu=True)
+                try:
+                    self._engine = RifeEngine(RIFE_MODEL_PATH, prefer_gpu=True)
+                except Exception as exc:
+                    # Keep the last failure so /api/system/model can explain why
+                    # the AI engine is unavailable instead of only logging it.
+                    self._engine_error = str(exc)
+                    raise
                 self._engine_error = None
             return self._engine
 
@@ -209,6 +216,7 @@ class JobManager:
             encoderKind=result.encoder_kind,
             interpolatedFrames=result.interpolated_frames,
             interpolationFactor=round(result.interpolation_factor, 4),
+            bitrate=result.bitrate,
         )
         job.update(
             status="done",
@@ -285,7 +293,7 @@ class JobManager:
                 self.delete(job_id)
                 removed += 1
         # Also remove orphan files from previous runs.
-        for directory in (UPLOADS_DIR, OUTPUTS_DIR):
+        for directory in (UPLOADS_DIR, OUTPUTS_DIR, TMP_DIR):
             if not directory.exists():
                 continue
             for path in directory.iterdir():
@@ -300,10 +308,31 @@ class JobManager:
         return removed
 
     def purge_all_files(self) -> None:
-        for directory in (UPLOADS_DIR, OUTPUTS_DIR):
+        for directory in (UPLOADS_DIR, OUTPUTS_DIR, TMP_DIR):
             if directory.exists():
                 shutil.rmtree(directory, ignore_errors=True)
             directory.mkdir(parents=True, exist_ok=True)
+
+    def shutdown(self) -> None:
+        """Cancel in-flight jobs and wait briefly for their FFmpeg children.
+
+        Called from the FastAPI lifespan on server shutdown (including closing
+        the desktop window) so a job cannot keep writing into storage after the
+        app has exited.
+        """
+        with self._lock:
+            jobs = list(self._jobs.values())
+        active = [job for job in jobs if job.state.status not in ("done", "error", "cancelled")]
+        for job in active:
+            job.cancel_event.set()
+        deadline = time.monotonic() + 20.0
+        for job in active:
+            thread = job.thread
+            if thread and thread.is_alive():
+                remaining = max(0.0, deadline - time.monotonic())
+                thread.join(timeout=min(5.0, remaining))
+        if active:
+            logger.info("Cancelled %d active job(s) during shutdown", len(active))
 
 
 def new_job_id() -> str:

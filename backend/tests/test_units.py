@@ -265,7 +265,8 @@ def test_encode_args_time_stretch_audio_for_slow_motion():
         audio_source="in.mp4", quality_cq=19, video_bitrate=None, audio_bitrate="192k",
         audio_speed=0.5,
     )
-    assert cmd[cmd.index("-af") + 1] == "atempo=0.500000"
+    # apad keeps "-shortest" from cutting the video when the audio track is short.
+    assert cmd[cmd.index("-af") + 1] == "atempo=0.500000,apad"
 
 
 # --------------------------------------------------- interpolation timing
@@ -858,5 +859,363 @@ def test_update_install_requires_a_ready_installer():
 
     update._DOWNLOAD.__init__()
     assert update.ready_installer() is None
+
+
+# ------------------------------------------------ reliability hardening
+def test_quarter_speed_audio_is_chained_not_rejected():
+    """FFmpeg rejects atempo=0.25; it must be split into two valid steps."""
+    encoder = EncoderChoice("libx264", "x264", False)
+    cmd = build_encode_command(
+        output_path="out.mp4", width=1080, height=1920, output_fps=30.0, encoder=encoder,
+        audio_source="in.mp4", quality_cq=19, video_bitrate=None, audio_bitrate="192k",
+        audio_speed=0.25,
+    )
+    filters = cmd[cmd.index("-af") + 1]
+    assert filters == "atempo=0.500000,atempo=0.500000,apad"
+    assert "-shortest" in cmd
+
+
+def test_atempo_decomposition_for_fast_and_slow_speeds():
+    from app.ffmpeg import _atempo_filters
+
+    assert _atempo_filters(1.0) == []
+    assert _atempo_filters(0.75) == ["atempo=0.750000"]
+    assert _atempo_filters(0.5) == ["atempo=0.500000"]
+    assert _atempo_filters(0.25) == ["atempo=0.500000", "atempo=0.500000"]
+    assert _atempo_filters(4.0) == ["atempo=2.000000", "atempo=2.000000"]
+    assert _atempo_filters(0) == []
+
+
+def test_x264_does_not_pin_an_output_level():
+    encoder = EncoderChoice("libx264", "x264", False)
+    cmd = build_encode_command(
+        output_path="out.mp4", width=1080, height=1920, output_fps=120.0, encoder=encoder,
+        audio_source=None, quality_cq=19, video_bitrate=None, audio_bitrate="192k",
+    )
+    assert "-level" not in cmd
+    assert "4.2" not in cmd
+
+
+@pytest.mark.parametrize(
+    "header,size,expected",
+    [
+        ("bytes=0-99", 1000, (0, 99)),
+        ("bytes=0-", 1000, (0, 999)),
+        ("bytes=100-", 1000, (100, 999)),
+        ("bytes=-100", 1000, (900, 999)),
+        ("bytes=900-5000", 1000, (900, 999)),
+        ("  bytes = 0 - 0  ", 1000, (0, 0)),
+        ("bytes=1000-", 1000, None),
+        ("bytes=500-400", 1000, None),
+        ("bytes=abc-def", 1000, None),
+        ("bytes=-", 1000, None),
+        ("bytes=-0", 1000, None),
+        ("items=0-10", 1000, None),
+        ("bytes=0-10", 0, None),
+    ],
+)
+def test_parse_range_header(header, size, expected):
+    from app.main import _parse_range_header
+
+    assert _parse_range_header(header, size) == expected
+
+
+def test_env_helpers_fall_back_on_malformed_values(monkeypatch):
+    from app import config
+
+    monkeypatch.setenv("AVE_TEST_FLOAT", "not-a-number")
+    monkeypatch.setenv("AVE_TEST_INT", "9999")
+    monkeypatch.setenv("AVE_TEST_BOOL", "YES")
+    assert config._env_float("AVE_TEST_FLOAT", 4.0) == 4.0
+    assert config._env_int("AVE_TEST_INT", 5, minimum=1, maximum=10) == 10
+    assert config._env_bool("AVE_TEST_BOOL") is True
+    assert config._env_str("AVE_TEST_MISSING", "fallback") == "fallback"
+
+    monkeypatch.setenv("AVE_TEST_FLOAT", "nan")
+    assert config._env_float("AVE_TEST_FLOAT", 2.5) == 2.5
+
+
+def _ffprobe_payload(**overrides):
+    import json
+
+    payload = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080,
+                "avg_frame_rate": "30/1",
+                "duration": "2.0",
+                "nb_frames": "60",
+                "pix_fmt": "yuv420p",
+            }
+        ],
+        "format": {"format_name": "mov,mp4,m4a", "size": "12345", "duration": "2.0"},
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def _fake_probe(monkeypatch, payload: str):
+    class _Proc:
+        returncode = 0
+        stdout = payload
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Proc())
+
+
+def test_probe_derives_missing_duration_from_frames(monkeypatch):
+    import json
+
+    from app.probe import probe_video
+
+    payload = json.loads(_ffprobe_payload())
+    payload["format"].pop("duration")
+    payload["streams"][0].pop("duration")
+    _fake_probe(monkeypatch, json.dumps(payload))
+    info = probe_video("sample.mp4")
+    assert info.duration == pytest.approx(2.0)
+    assert info.nb_frames == 60
+
+
+def test_probe_rejects_unusable_duration(monkeypatch):
+    import json
+
+    from app.probe import ProbeError, probe_video
+
+    payload = json.loads(_ffprobe_payload())
+    payload["format"].pop("duration")
+    payload["streams"][0].pop("duration")
+    payload["streams"][0].pop("nb_frames")
+    _fake_probe(monkeypatch, json.dumps(payload))
+    with pytest.raises(ProbeError, match="duration"):
+        probe_video("sample.mp4")
+
+
+def test_probe_rejects_absurd_frame_rate(monkeypatch):
+    import json
+
+    from app.probe import ProbeError, probe_video
+
+    payload = json.loads(_ffprobe_payload())
+    payload["streams"][0]["avg_frame_rate"] = "999999/1"
+    payload["streams"][0]["r_frame_rate"] = "999999/1"
+    _fake_probe(monkeypatch, json.dumps(payload))
+    with pytest.raises(ProbeError, match="frame rate"):
+        probe_video("sample.mp4")
+
+
+def test_probe_tolerates_na_audio_metadata(monkeypatch):
+    import json
+
+    from app.probe import probe_video
+
+    payload = json.loads(_ffprobe_payload())
+    payload["streams"].append(
+        {"codec_type": "audio", "codec_name": "aac", "channels": "N/A", "sample_rate": "N/A"}
+    )
+    payload["format"]["size"] = "N/A"
+    _fake_probe(monkeypatch, json.dumps(payload))
+    info = probe_video("sample.mp4")
+    assert info.has_audio is True
+    assert info.audio_channels is None
+    assert info.audio_sample_rate is None
+    assert info.size_bytes == 0
+
+
+def test_update_rejects_non_https_installer_url():
+    import json
+
+    from app import update
+
+    payload = json.loads(_fake_release())
+    payload["assets"][0]["browser_download_url"] = "http://example.com/setup.exe"
+    assert update._parse_release(payload) is None
+    assert update._is_safe_installer_url("http://example.com/setup.exe") is False
+    assert update._is_safe_installer_url("https://example.com/setup.exe") is True
+    assert update._is_safe_installer_url("https://example.com/setup.zip") is False
+
+
+def test_update_start_download_rejects_unsafe_url():
+    from app import update
+
+    info = update.UpdateInfo(
+        tag="v9.9.9", version="9.9.9", url="http://example.com/setup.exe",
+        size_bytes=1, notes="", published_at="", sha256=None,
+    )
+    with pytest.raises(ValueError):
+        update.start_download(info)
+
+
+def test_update_download_rejects_size_mismatch(monkeypatch, tmp_path):
+    from app import update
+
+    content = b"x" * 10
+
+    class _FakeUrlLib:
+        @staticmethod
+        def Request(url, headers=None):  # noqa: N803
+            return url
+
+        @staticmethod
+        def urlopen(req, timeout):
+            return _FakeResponse(content, {"Content-Length": str(len(content))})
+
+    monkeypatch.setattr(update, "STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(update, "urlrequest", _FakeUrlLib)
+    info = update.UpdateInfo(
+        tag="v9.9.9", version="9.9.9", url="https://x/setup.exe",
+        size_bytes=999, notes="", published_at="", sha256=None,
+    )
+    update._DOWNLOAD.__init__()
+    update.start_download(info)
+    for _ in range(500):
+        if update._DOWNLOAD.state != "downloading":
+            break
+        time.sleep(0.01)
+    assert update._DOWNLOAD.state == "error"
+    assert "size" in (update._DOWNLOAD.error or "").lower()
+    assert update.ready_installer() is None
+
+
+def test_update_prunes_old_installers(tmp_path, monkeypatch):
+    from app import update
+
+    monkeypatch.setattr(update, "STORAGE_DIR", tmp_path)
+    directory = tmp_path / "updates"
+    directory.mkdir()
+    keep = directory / "new-setup.exe"
+    keep.write_bytes(b"new")
+    old = directory / "old-setup.exe"
+    old.write_bytes(b"old")
+    part = directory / "unfinished.exe.part"
+    part.write_bytes(b"part")
+    other = directory / "notes.txt"
+    other.write_text("keep me")
+
+    update._prune_installers(keep=keep)
+    assert keep.exists()
+    assert not old.exists()
+    assert not part.exists()
+    assert other.exists()
+
+
+def test_begin_job_resets_sticky_tiling():
+    import threading
+
+    import app.rife as rife
+
+    engine = object.__new__(rife.RifeEngine)
+    engine._lock = threading.Lock()
+    engine.using_gpu = True
+    engine._use_tiles = True
+    engine._tile_height = 96
+    engine.last_error = "old error"
+    rife.RifeEngine.begin_job(engine)
+    assert engine._use_tiles is False
+    assert engine._tile_height == rife.DEFAULT_TILE_HEIGHT
+    assert engine.last_error is None
+
+    # CPU mode has no tiling state to reset.
+    engine.using_gpu = False
+    engine._use_tiles = True
+    rife.RifeEngine.begin_job(engine)
+    assert engine._use_tiles is True
+
+
+def test_shutdown_cancels_active_jobs(tmp_path):
+    from app.jobs import Job, JobManager
+    from app.schemas import JobSettings, JobState
+
+    manager = JobManager()
+    job = Job(
+        id="active",
+        settings=JobSettings(),
+        upload_path=tmp_path / "in.mp4",
+        output_path=tmp_path / "out.mp4",
+        state=JobState(id="active", status="processing"),
+    )
+    manager._jobs["active"] = job
+    manager.shutdown()
+    assert job.cancel_event.is_set()
+
+
+# --------------------------------------------------------------- API responses
+def _client():
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    return TestClient(main.app), main
+
+
+def test_health_endpoint_reports_ffmpeg_state(monkeypatch):
+    client, main = _client()
+    monkeypatch.setattr(main, "ffmpeg_available", lambda: True)
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "ffmpeg": True}
+
+
+def test_system_endpoint_reflects_encoder_and_model_state(monkeypatch, tmp_path):
+    from app.ffmpeg import EncoderChoice
+
+    client, main = _client()
+    model = tmp_path / "RIFE_fp32_timestep.onnx"
+    model.write_bytes(b"fake model")
+    monkeypatch.setattr(main, "RIFE_MODEL_PATH", model)
+    monkeypatch.setattr(
+        main, "detect_capabilities", lambda: {"ffmpegFound": True, "nvencUsable": False}
+    )
+    monkeypatch.setattr(
+        main,
+        "choose_encoder",
+        lambda codec: EncoderChoice("libx264" if codec == "h264" else "libx265", "x264", False),
+    )
+    monkeypatch.setattr(main, "resolve_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(main, "gpu_memory_info", lambda: None)
+    monkeypatch.setattr(main, "_gpu_name", lambda: "Test GPU")
+    monkeypatch.setattr(main.manager, "engine_status", lambda: (None, "could not load model"))
+
+    response = client.get("/api/system")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["rifeModelAvailable"] is True
+    assert data["rifeError"] == "could not load model"
+    assert data["h264Encoder"] == "libx264"
+    assert data["h265Encoder"] == "libx265"
+    assert data["gpuName"] == "Test GPU"
+    assert data["limits"]["maxUploadBytes"] > 0
+    assert "tiktok" in data["presets"]["dimensions"]
+
+
+def test_unknown_job_endpoints_return_404():
+    client, _ = _client()
+    assert client.get("/api/jobs/does-not-exist").status_code == 404
+    assert client.get("/api/jobs/does-not-exist/download").status_code == 404
+    assert client.delete("/api/jobs/does-not-exist").status_code == 404
+
+
+def test_probe_rejects_empty_upload():
+    from app.config import ensure_dirs
+
+    ensure_dirs()
+    client, _ = _client()
+    response = client.post(
+        "/api/probe",
+        files={"file": ("empty.mp4", b"", "video/mp4")},
+    )
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"].lower()
+
+
+def test_update_download_without_an_update_returns_409(monkeypatch):
+    client, main = _client()
+    monkeypatch.setattr(main.update, "check_for_update", lambda: None)
+    response = client.post("/api/update/download")
+    assert response.status_code == 409
 
 
